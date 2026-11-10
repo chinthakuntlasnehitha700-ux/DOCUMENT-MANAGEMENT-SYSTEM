@@ -1,0 +1,177 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DocuMind AI | Document Management</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="app-container">
+
+    <aside class="sidebar">
+        <div class="brand">
+            <div class="brand-icon">D</div>
+            <div>
+                <h2>DocuMind AI</h2>
+                <small>Document Intelligence</small>
+            </div>
+        </div>
+
+        <p class="menu-label">MAIN MENU</p>
+
+        <nav>
+            <button class="nav-btn active" data-page="dashboard">▦ Dashboard</button>
+            <button class="nav-btn" data-page="documents">▤ My Documents</button>
+            <button class="nav-btn" data-page="upload">＋ Upload Documents</button>
+        </nav>
+
+        <div class="sidebar-bottom">
+            <div class="storage-card">
+                <p>Document Storage</p>
+                <h3 id="sidebar-count">0 Documents</h3>
+                <small>Your documents are stored locally on the server.</small>
+            </div>
+            <p class="version">Document Management System v1.0</p>
+        </div>
+    </aside>
+
+    <main class="main-content">
+
+        <header class="topbar">
+            <div>
+                <h3 id="page-title">Dashboard</h3>
+                <p>Manage and organize your documents</p>
+            </div>
+            <button class="primary-btn" id="header-upload">＋ Upload Document</button>
+        </header>
+
+        <!-- DASHBOARD -->
+        <section id="dashboard-page" class="page active-page">
+
+            <div class="welcome">
+                <div>
+                    <p class="eyebrow">DOCUMENT MANAGEMENT SYSTEM</p>
+                    <h1>Welcome to DocuMind AI</h1>
+                    <p>Store, organize and access all your important documents in one place.</p>
+                </div>
+            </div>
+
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <span>Total Documents</span>
+                    <h2 id="total-documents">0</h2>
+                    <small>Documents stored</small>
+                </div>
+
+                <div class="stat-card">
+                    <span>PDF Documents</span>
+                    <h2 id="pdf-count">0</h2>
+                    <small>PDF files uploaded</small>
+                </div>
+
+                <div class="stat-card">
+                    <span>Word Documents</span>
+                    <h2 id="docx-count">0</h2>
+                    <small>DOCX files uploaded</small>
+                </div>
+
+                <div class="stat-card">
+                    <span>Text Documents</span>
+                    <h2 id="txt-count">0</h2>
+                    <small>TXT files uploaded</small>
+                </div>
+            </div>
+
+            <div class="section-card">
+                <div class="section-heading">
+                    <div>
+                        <h2>Recent Documents</h2>
+                        <p>Your recently uploaded files</p>
+                    </div>
+                    <button class="text-btn" id="view-all">View All</button>
+                </div>
+
+                <div id="recent-documents" class="document-list"></div>
+            </div>
+
+        </section>
+
+        <!-- MY DOCUMENTS -->
+        <section id="documents-page" class="page">
+
+            <div class="section-card">
+                <div class="section-heading">
+                    <div>
+                        <h2>My Documents</h2>
+                        <p>View and manage your uploaded documents</p>
+                    </div>
+                    <button class="primary-btn" id="documents-upload">＋ Upload</button>
+                </div>
+
+                <div class="search-area">
+                    <input type="text" id="search-input"
+                        placeholder="Search documents by name or content...">
+
+                    <button class="primary-btn" id="search-button">Search</button>
+                    <button class="secondary-btn" id="clear-search">Clear</button>
+                </div>
+
+                <div id="all-documents" class="document-list"></div>
+            </div>
+
+        </section>
+
+        <!-- UPLOAD DOCUMENTS -->
+        <section id="upload-page" class="page">
+
+            <div class="section-card upload-section">
+                <h2>Upload Your Documents</h2>
+                <p>Select PDF, DOCX or TXT documents to upload and process.</p>
+
+                <div class="upload-box" id="drop-zone">
+                    <div class="upload-icon">↑</div>
+                    <h3>Drag and drop your documents here</h3>
+                    <p>or select files from your computer</p>
+
+                    <input type="file" id="file-input"
+                        accept=".pdf,.docx,.txt" multiple hidden>
+
+                    <button class="primary-btn" id="choose-file">Choose Files</button>
+
+                    <small>Supported formats: PDF, DOCX, TXT | Maximum 10 MB per file</small>
+                </div>
+
+                <div id="selected-files"></div>
+
+                <button class="primary-btn upload-submit" id="upload-button" disabled>
+                    Upload Documents
+                </button>
+
+                <p id="upload-message"></p>
+            </div>
+
+        </section>
+
+    </main>
+</div>
+
+<!-- DOCUMENT PREVIEW MODAL -->
+<div class="modal" id="preview-modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h2 id="preview-title">Document Preview</h2>
+            <button class="close-btn" id="close-preview">×</button>
+        </div>
+        <div id="preview-body"></div>
+    </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script src="script.js"></script>
+
+</body>
+</html>
