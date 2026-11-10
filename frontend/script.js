@@ -1,5 +1,5 @@
 
-const API = "http://127.0.0.1:5000/api";
+const API = "https://documind-ai-api-3jx2.onrender.com/api";
 
 let selectedFiles = [];
 let allDocuments = [];
