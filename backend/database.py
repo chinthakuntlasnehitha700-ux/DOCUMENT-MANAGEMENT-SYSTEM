@@ -1,4 +1,4 @@
-import sqlite3
+﻿import sqlite3
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -30,6 +30,4 @@ def create_tables():
     connection.close()
 
 
-if __name__ == "__main__":
-    create_tables()
-    print("Database created successfully!")
+create_tables()
