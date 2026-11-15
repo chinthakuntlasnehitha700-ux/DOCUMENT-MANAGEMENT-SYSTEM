@@ -87,6 +87,33 @@ function updateDashboard(documents) {
     $("sidebar-count").textContent = documents.length + " Documents";
 }
 
+// FORMAT UPLOADED DATE
+function formatUploadedDate(value) {
+    if (!value) return "Date unavailable";
+
+    // Handle backend date strings such as:
+    // Sun, 15 Nov 2026 04:44:49 GMT
+    // 2026-11-15T04:44:49
+    let uploadedDate = new Date(value);
+
+    // Handle SQLite-style date strings if needed
+    if (Number.isNaN(uploadedDate.getTime()) && typeof value === "string") {
+        uploadedDate = new Date(value.replace(" ", "T") + "Z");
+    }
+
+    if (Number.isNaN(uploadedDate.getTime())) {
+        return "Date unavailable";
+    }
+
+    return uploadedDate.toLocaleString("en-IN", {
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit"
+    });
+}
+
 // DISPLAY DOCUMENTS
 function renderDocuments(documents, containerId) {
     const container = $(containerId);
@@ -115,8 +142,7 @@ function renderDocuments(documents, containerId) {
         name.textContent = doc.filename;
 
         const date = document.createElement("small");
-        date.textContent =
-            "Uploaded: " + new Date(doc.uploaded_at + "Z").toLocaleString();
+        date.textContent = "Uploaded: " + formatUploadedDate(doc.uploaded_at);
 
         details.append(name, date);
         info.append(icon, details);
@@ -273,7 +299,7 @@ async function extractInformation(id) {
 
             const list = document.createElement("ul");
 
-            if (values.length === 0) {
+            if (!Array.isArray(values) || values.length === 0) {
                 const item = document.createElement("li");
                 item.textContent = "No information found";
                 list.appendChild(item);
