@@ -125,7 +125,6 @@ def extract_key_information(text):
         "important_terms": []
     }
 
-    # Extract possible names
     names = re.findall(
         r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}\b',
         text
@@ -133,7 +132,6 @@ def extract_key_information(text):
 
     information["names"] = list(dict.fromkeys(names))[:20]
 
-    # Extract dates
     dates = re.findall(
         r'\b(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|'
         r'\d{1,2}\s+(?:January|February|March|April|May|June|'
@@ -142,9 +140,8 @@ def extract_key_information(text):
         re.IGNORECASE
     )
 
-    information["dates"] = list(dict.fromkeys(dates))[:20]
+    information["dates"] = list(dict.fromkeys(dates) )[:20]
 
-    # Extract deadline-related sentences
     deadline_sentences = re.findall(
         r'[^.!?]*(?:deadline|due date|submit by|submission date|'
         r'last date|before the date)[^.!?]*[.!?]?',
@@ -157,7 +154,6 @@ def extract_key_information(text):
         for sentence in deadline_sentences[:10]
     ]
 
-    # Extract monetary amounts
     amounts = re.findall(
         r'(?:₹|Rs\.?|INR|\$|USD|€|£)\s?[\d,]+(?:\.\d{1,2})?',
         text,
@@ -166,7 +162,6 @@ def extract_key_information(text):
 
     information["amounts"] = list(dict.fromkeys(amounts))[:20]
 
-    # Identify important terms
     terms = [
         "agreement", "payment", "deadline", "submission",
         "contract", "project", "salary", "invoice",
@@ -283,19 +278,38 @@ def upload_document():
 
         connection = get_connection()
 
-        cursor = connection.execute("""
-            INSERT INTO documents
-            (filename, stored_name, file_type, category, extracted_text)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            original_name,
-            stored_name,
-            extension.upper(),
-            "Uncategorized",
-            extracted_text
-        ))
+        if os.getenv("DATABASE_URL"):
 
-        document_id = cursor.lastrowid
+            cursor = connection.execute("""
+                INSERT INTO documents
+                (filename, stored_name, file_type, category, extracted_text)
+                VALUES (?, ?, ?, ?, ?)
+                RETURNING id
+            """, (
+                original_name,
+                stored_name,
+                extension.upper(),
+                "Uncategorized",
+                extracted_text
+            ))
+
+            document_id = cursor.fetchone()["id"]
+
+        else:
+
+            cursor = connection.execute("""
+                INSERT INTO documents
+                (filename, stored_name, file_type, category, extracted_text)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                original_name,
+                stored_name,
+                extension.upper(),
+                "Uncategorized",
+                extracted_text
+            ))
+
+            document_id = cursor.lastrowid
 
         connection.commit()
         connection.close()
@@ -354,9 +368,7 @@ def get_document(document_id):
     if document is None:
         return jsonify({"error": "Document not found"}), 404
 
-    result = dict(document)
-
-    return jsonify(result)
+    return jsonify(dict(document))
 
 
 # ---------------------------------
@@ -533,13 +545,19 @@ def file_too_large(error):
 
 
 # ---------------------------------
+# CREATE DATABASE TABLES
+# ---------------------------------
+
+# This also runs when Gunicorn imports this file on Render.
+create_tables()
+
+
+# ---------------------------------
 # START BACKEND
 # ---------------------------------
 
 if __name__ == "__main__":
 
-    create_tables()
-
     print("Document Management System backend started!")
 
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=False)

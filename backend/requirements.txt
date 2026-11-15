@@ -3,3 +3,4 @@ flask-cors
 pypdf
 python-docx
 gunicorn
+psycopg[binary]
