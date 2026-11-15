@@ -4,27 +4,53 @@ import uuid
 import re
 from pathlib import Path
 from collections import Counter
+from io import BytesIO
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from pypdf import PdfReader
 from docx import Document
+from supabase import create_client
+from dotenv import load_dotenv
 
 from database import get_connection, create_tables
 
 
+# ---------------------------------
+# ENVIRONMENT AND CONFIGURATION
+# ---------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+
+load_dotenv(BASE_DIR / ".env")
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError(
+        "Missing Supabase environment variables. "
+        "Check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY."
+    )
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 app = Flask(__name__)
 CORS(app)
 
-BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_FOLDER = BASE_DIR / "uploads"
-
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
 ALLOWED_EXTENSIONS = {"pdf", "docx", "txt"}
+
+CONTENT_TYPES = {
+    "pdf": "application/pdf",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "txt": "text/plain"
+}
 
 
 # ---------------------------------
@@ -140,7 +166,7 @@ def extract_key_information(text):
         re.IGNORECASE
     )
 
-    information["dates"] = list(dict.fromkeys(dates) )[:20]
+    information["dates"] = list(dict.fromkeys(dates))[:20]
 
     deadline_sentences = re.findall(
         r'[^.!?]*(?:deadline|due date|submit by|submission date|'
@@ -262,20 +288,40 @@ def upload_document():
 
     file_path = UPLOAD_FOLDER / stored_name
 
-    uploaded_file.save(file_path)
+    connection = None
+    storage_uploaded = False
 
     try:
+
+        # Temporarily save file for text extraction
+        uploaded_file.save(file_path)
 
         extracted_text = extract_text(file_path, extension)
 
         if not extracted_text.strip():
 
-            file_path.unlink(missing_ok=True)
-
             return jsonify({
-                "error": "No readable text found in this document. Scanned PDFs may need OCR."
+                "error": (
+                    "No readable text found in this document. "
+                    "Scanned PDFs may need OCR."
+                )
             }), 400
 
+        # Upload actual file to Supabase Storage
+        with open(file_path, "rb") as file:
+
+            supabase.storage.from_("documents").upload(
+                path=stored_name,
+                file=file,
+                file_options={
+                    "content-type": CONTENT_TYPES[extension],
+                    "upsert": "false"
+                }
+            )
+
+        storage_uploaded = True
+
+        # Save document information in PostgreSQL / SQLite
         connection = get_connection()
 
         if os.getenv("DATABASE_URL"):
@@ -312,7 +358,6 @@ def upload_document():
             document_id = cursor.lastrowid
 
         connection.commit()
-        connection.close()
 
         return jsonify({
             "message": "Document uploaded successfully",
@@ -323,11 +368,35 @@ def upload_document():
 
     except Exception as error:
 
-        file_path.unlink(missing_ok=True)
+        print("UPLOAD ERROR:", str(error))
+
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+        # Remove uploaded object if database saving failed
+        if storage_uploaded:
+            try:
+                supabase.storage.from_("documents").remove([stored_name])
+            except Exception as storage_error:
+                print("SUPABASE CLEANUP ERROR:", str(storage_error))
 
         return jsonify({
             "error": f"Document processing failed: {str(error)}"
         }), 500
+
+    finally:
+
+        # Remove temporary local copy
+        file_path.unlink(missing_ok=True)
+
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------
@@ -339,15 +408,18 @@ def get_documents():
 
     connection = get_connection()
 
-    documents = connection.execute("""
-        SELECT id, filename, file_type, category, uploaded_at
-        FROM documents
-        ORDER BY uploaded_at DESC
-    """).fetchall()
+    try:
 
-    connection.close()
+        documents = connection.execute("""
+            SELECT id, filename, file_type, category, uploaded_at
+            FROM documents
+            ORDER BY uploaded_at DESC
+        """).fetchall()
 
-    return jsonify([dict(document) for document in documents])
+        return jsonify([dict(document) for document in documents])
+
+    finally:
+        connection.close()
 
 
 # ---------------------------------
@@ -359,11 +431,14 @@ def get_document(document_id):
 
     connection = get_connection()
 
-    document = connection.execute("""
-        SELECT * FROM documents WHERE id = ?
-    """, (document_id,)).fetchone()
+    try:
 
-    connection.close()
+        document = connection.execute("""
+            SELECT * FROM documents WHERE id = ?
+        """, (document_id,)).fetchone()
+
+    finally:
+        connection.close()
 
     if document is None:
         return jsonify({"error": "Document not found"}), 404
@@ -380,20 +455,57 @@ def view_document(document_id):
 
     connection = get_connection()
 
-    document = connection.execute("""
-        SELECT stored_name FROM documents WHERE id = ?
-    """, (document_id,)).fetchone()
+    try:
 
-    connection.close()
+        document = connection.execute("""
+            SELECT filename, stored_name, file_type
+            FROM documents
+            WHERE id = ?
+        """, (document_id,)).fetchone()
+
+    finally:
+        connection.close()
 
     if document is None:
         return jsonify({"error": "Document not found"}), 404
 
-    return send_from_directory(
-        UPLOAD_FOLDER,
-        document["stored_name"],
-        as_attachment=False
-    )
+    stored_name = document["stored_name"]
+    filename = document["filename"]
+    extension = document["file_type"].lower()
+
+    try:
+
+        # First try to retrieve the file from Supabase
+        file_data = supabase.storage.from_("documents").download(
+            stored_name
+        )
+
+        return send_file(
+            BytesIO(file_data),
+            mimetype=CONTENT_TYPES.get(extension, "application/octet-stream"),
+            download_name=filename,
+            as_attachment=False
+        )
+
+    except Exception as error:
+
+        print("SUPABASE VIEW ERROR:", str(error))
+
+        # Fallback for older files still present locally
+        local_file = UPLOAD_FOLDER / stored_name
+
+        if local_file.exists():
+
+            return send_file(
+                local_file,
+                mimetype=CONTENT_TYPES.get(extension, "application/octet-stream"),
+                download_name=filename,
+                as_attachment=False
+            )
+
+        return jsonify({
+            "error": "Unable to retrieve document from storage"
+        }), 500
 
 
 # ---------------------------------
@@ -405,30 +517,50 @@ def delete_document(document_id):
 
     connection = get_connection()
 
-    document = connection.execute("""
-        SELECT stored_name FROM documents WHERE id = ?
-    """, (document_id,)).fetchone()
+    try:
 
-    if document is None:
+        document = connection.execute("""
+            SELECT stored_name FROM documents WHERE id = ?
+        """, (document_id,)).fetchone()
 
+        if document is None:
+            return jsonify({"error": "Document not found"}), 404
+
+        stored_name = document["stored_name"]
+        local_file = UPLOAD_FOLDER / stored_name
+
+        # Remove file from Supabase Storage
+        try:
+
+            supabase.storage.from_("documents").remove([stored_name])
+
+        except Exception as storage_error:
+
+            print("SUPABASE DELETE ERROR:", str(storage_error))
+
+            # Allow deletion of older local-only files
+            if not local_file.exists():
+
+                return jsonify({
+                    "error": "Could not delete document from storage"
+                }), 500
+
+        # Delete metadata from database
+        connection.execute("""
+            DELETE FROM documents WHERE id = ?
+        """, (document_id,))
+
+        connection.commit()
+
+        # Delete any remaining local copy
+        local_file.unlink(missing_ok=True)
+
+        return jsonify({
+            "message": "Document deleted successfully"
+        })
+
+    finally:
         connection.close()
-
-        return jsonify({"error": "Document not found"}), 404
-
-    connection.execute("""
-        DELETE FROM documents WHERE id = ?
-    """, (document_id,))
-
-    connection.commit()
-    connection.close()
-
-    file_path = UPLOAD_FOLDER / document["stored_name"]
-
-    file_path.unlink(missing_ok=True)
-
-    return jsonify({
-        "message": "Document deleted successfully"
-    })
 
 
 # ---------------------------------
@@ -445,28 +577,41 @@ def search_documents():
 
     connection = get_connection()
 
-    documents = connection.execute("""
-        SELECT id, filename, file_type, category, uploaded_at
-        FROM documents
-        WHERE filename LIKE ? OR extracted_text LIKE ?
-        ORDER BY uploaded_at DESC
-    """, (f"%{query}%", f"%{query}%")).fetchall()
+    try:
 
-    connection.close()
+        documents = connection.execute("""
+            SELECT id, filename, file_type, category, uploaded_at
+            FROM documents
+            WHERE filename LIKE ? OR extracted_text LIKE ?
+            ORDER BY uploaded_at DESC
+        """, (f"%{query}%", f"%{query}%")).fetchall()
 
-    return jsonify([dict(document) for document in documents])
+        return jsonify([dict(document) for document in documents])
+
+    finally:
+        connection.close()
 
 
 # ---------------------------------
 # DOCUMENT SUMMARIZATION API
 # ---------------------------------
 
-@app.route("/api/documents/<int:document_id>/summarize", methods=["POST"])
+@app.route(
+    "/api/documents/<int:document_id>/summarize",
+    methods=["POST"]
+)
 def summarize_document(document_id):
 
     data = request.get_json(silent=True) or {}
 
-    length = data.get("length", "short").lower()
+    length = data.get("length", "short")
+
+    if not isinstance(length, str):
+        return jsonify({
+            "error": "Choose short, medium or detailed summary"
+        }), 400
+
+    length = length.lower()
 
     if length not in ["short", "medium", "detailed"]:
 
@@ -476,13 +621,16 @@ def summarize_document(document_id):
 
     connection = get_connection()
 
-    document = connection.execute("""
-        SELECT filename, extracted_text
-        FROM documents
-        WHERE id = ?
-    """, (document_id,)).fetchone()
+    try:
 
-    connection.close()
+        document = connection.execute("""
+            SELECT filename, extracted_text
+            FROM documents
+            WHERE id = ?
+        """, (document_id,)).fetchone()
+
+    finally:
+        connection.close()
 
     if document is None:
         return jsonify({"error": "Document not found"}), 404
@@ -511,13 +659,16 @@ def extract_document_information(document_id):
 
     connection = get_connection()
 
-    document = connection.execute("""
-        SELECT filename, extracted_text
-        FROM documents
-        WHERE id = ?
-    """, (document_id,)).fetchone()
+    try:
 
-    connection.close()
+        document = connection.execute("""
+            SELECT filename, extracted_text
+            FROM documents
+            WHERE id = ?
+        """, (document_id,)).fetchone()
+
+    finally:
+        connection.close()
 
     if document is None:
         return jsonify({"error": "Document not found"}), 404
@@ -548,7 +699,6 @@ def file_too_large(error):
 # CREATE DATABASE TABLES
 # ---------------------------------
 
-# This also runs when Gunicorn imports this file on Render.
 create_tables()
 
 
