@@ -1,74 +1,131 @@
 ﻿
 import os
-import sqlite3
-from pathlib import Path
+from datetime import datetime, timezone
 
-BASE_DIR = Path(__file__).resolve().parent
-DATABASE_PATH = BASE_DIR / "documents.db"
+from pymongo import MongoClient, ReturnDocument, ASCENDING, DESCENDING
+from pymongo.errors import PyMongoError
 
+MONGODB_URI = os.getenv("MONGODB_URI")
 
-class PostgreSQLConnection:
-    def __init__(self, connection):
-        self.connection = connection
+if not MONGODB_URI:
+    raise RuntimeError("MONGODB_URI is missing from environment variables.")
 
-    def execute(self, query, params=()):
-        query = query.replace("?", "%s")
-        cursor = self.connection.cursor()
-        cursor.execute(query, params)
-        return cursor
+client = MongoClient(
+    MONGODB_URI,
+    serverSelectionTimeoutMS=10000
+)
 
-    def commit(self):
-        self.connection.commit()
+db = client["documind_ai"]
 
-    def close(self):
-        self.connection.close()
+documents_collection = db["documents"]
+counters_collection = db["counters"]
 
 
-def get_connection():
+def create_tables():
+    """Connect to MongoDB and prepare collections."""
+
+    client.admin.command("ping")
+
+    documents_collection.create_index(
+        [("id", ASCENDING)],
+        unique=True
+    )
+
+    documents_collection.create_index(
+        [("uploaded_at", DESCENDING)]
+    )
+
+    print("MongoDB Connected Successfully!")
+
+    migrate_old_documents()
+
+
+def next_document_id():
+    """Generate an integer ID for the website."""
+
+    counter = counters_collection.find_one_and_update(
+        {"_id": "documents"},
+        {"$inc": {"sequence_value": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER
+    )
+
+    return counter["sequence_value"]
+
+
+def migrate_old_documents():
+    """
+    Copy existing PostgreSQL documents into MongoDB.
+    Existing document IDs are preserved.
+    """
+
     database_url = os.getenv("DATABASE_URL")
 
-    if database_url:
+    if not database_url:
+        print("No old PostgreSQL database configured. Migration skipped.")
+        return
+
+    try:
         import psycopg
         from psycopg.rows import dict_row
 
         connection = psycopg.connect(
             database_url,
-            row_factory=dict_row
+            row_factory=dict_row,
+            connect_timeout=10
         )
-        return PostgreSQLConnection(connection)
 
-    connection = sqlite3.connect(DATABASE_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
+        try:
+            old_documents = connection.execute("""
+                SELECT id, filename, stored_name, file_type,
+                       category, extracted_text, uploaded_at
+                FROM documents
+            """).fetchall()
+        finally:
+            connection.close()
 
+        migrated_count = 0
+        highest_id = 0
 
-def create_tables():
-    connection = get_connection()
+        for old_document in old_documents:
+            document = dict(old_document)
 
-    if os.getenv("DATABASE_URL"):
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS documents (
-                id SERIAL PRIMARY KEY,
-                filename TEXT NOT NULL,
-                stored_name TEXT NOT NULL,
-                file_type TEXT NOT NULL,
-                category TEXT DEFAULT 'Uncategorized',
-                extracted_text TEXT DEFAULT '',
-                uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            document_id = int(document["id"])
+            highest_id = max(highest_id, document_id)
+
+            document["id"] = document_id
+
+            if document.get("uploaded_at") is None:
+                document["uploaded_at"] = datetime.now(timezone.utc)
+
+            existing = documents_collection.find_one(
+                {"id": document_id}
             )
-        """)
-    else:
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                filename TEXT NOT NULL,
-                stored_name TEXT NOT NULL,
-                file_type TEXT NOT NULL,
-                category TEXT DEFAULT 'Uncategorized',
-                extracted_text TEXT DEFAULT '',
-                uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
 
-    connection.commit()
-    connection.close()
+            if existing is None:
+                documents_collection.insert_one(document)
+                migrated_count += 1
+
+        if highest_id:
+            counters_collection.update_one(
+                {"_id": "documents"},
+                {
+                    "$max": {
+                        "sequence_value": highest_id
+                    }
+                },
+                upsert=True
+            )
+
+        print(
+            f"MongoDB migration completed. "
+            f"{migrated_count} old documents copied."
+        )
+
+    except Exception as error:
+        print("OLD DATABASE MIGRATION ERROR:", str(error))
+        raise
+
+
+def get_documents_collection():
+    return documents_collection

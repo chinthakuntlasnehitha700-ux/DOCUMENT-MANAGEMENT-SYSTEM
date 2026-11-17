@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from collections import Counter
 from io import BytesIO
+from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -14,7 +15,11 @@ from docx import Document
 from supabase import create_client
 from dotenv import load_dotenv
 
-from database import get_connection, create_tables
+from database import (
+    create_tables,
+    get_documents_collection,
+    next_document_id
+)
 
 
 # ---------------------------------
@@ -51,6 +56,29 @@ CONTENT_TYPES = {
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "txt": "text/plain"
 }
+
+documents_collection = get_documents_collection()
+
+
+# ---------------------------------
+# DOCUMENT RESPONSE FORMAT
+# ---------------------------------
+
+def format_document(document):
+
+    if document is None:
+        return None
+
+    result = dict(document)
+
+    result.pop("_id", None)
+
+    uploaded_at = result.get("uploaded_at")
+
+    if isinstance(uploaded_at, datetime):
+        result["uploaded_at"] = uploaded_at.isoformat()
+
+    return result
 
 
 # ---------------------------------
@@ -251,10 +279,26 @@ def extract_text(file_path, extension):
 @app.route("/api/health", methods=["GET"])
 def health():
 
-    return jsonify({
-        "status": "success",
-        "message": "Document Management System backend is running"
-    })
+    try:
+        from database import client
+        client.admin.command("ping")
+
+        return jsonify({
+            "status": "success",
+            "message": "Document Management System backend is running",
+            "mongodb": "connected",
+            "database": "documind_ai"
+        })
+
+    except Exception as error:
+
+        print("MONGODB HEALTH ERROR:", str(error))
+
+        return jsonify({
+            "status": "error",
+            "message": "MongoDB connection failed",
+            "mongodb": "disconnected"
+        }), 503
 
 
 # ---------------------------------
@@ -288,12 +332,10 @@ def upload_document():
 
     file_path = UPLOAD_FOLDER / stored_name
 
-    connection = None
     storage_uploaded = False
 
     try:
 
-        # Temporarily save file for text extraction
         uploaded_file.save(file_path)
 
         extracted_text = extract_text(file_path, extension)
@@ -307,7 +349,7 @@ def upload_document():
                 )
             }), 400
 
-        # Upload actual file to Supabase Storage
+        # Store the actual file in Supabase
         with open(file_path, "rb") as file:
 
             supabase.storage.from_("documents").upload(
@@ -321,43 +363,20 @@ def upload_document():
 
         storage_uploaded = True
 
-        # Save document information in PostgreSQL / SQLite
-        connection = get_connection()
+        # Store document details in MongoDB
+        document_id = next_document_id()
 
-        if os.getenv("DATABASE_URL"):
+        document = {
+            "id": document_id,
+            "filename": original_name,
+            "stored_name": stored_name,
+            "file_type": extension.upper(),
+            "category": "Uncategorized",
+            "extracted_text": extracted_text,
+            "uploaded_at": datetime.now(timezone.utc)
+        }
 
-            cursor = connection.execute("""
-                INSERT INTO documents
-                (filename, stored_name, file_type, category, extracted_text)
-                VALUES (?, ?, ?, ?, ?)
-                RETURNING id
-            """, (
-                original_name,
-                stored_name,
-                extension.upper(),
-                "Uncategorized",
-                extracted_text
-            ))
-
-            document_id = cursor.fetchone()["id"]
-
-        else:
-
-            cursor = connection.execute("""
-                INSERT INTO documents
-                (filename, stored_name, file_type, category, extracted_text)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                original_name,
-                stored_name,
-                extension.upper(),
-                "Uncategorized",
-                extracted_text
-            ))
-
-            document_id = cursor.lastrowid
-
-        connection.commit()
+        documents_collection.insert_one(document)
 
         return jsonify({
             "message": "Document uploaded successfully",
@@ -370,13 +389,6 @@ def upload_document():
 
         print("UPLOAD ERROR:", str(error))
 
-        if connection is not None:
-            try:
-                connection.close()
-            except Exception:
-                pass
-
-        # Remove uploaded object if database saving failed
         if storage_uploaded:
             try:
                 supabase.storage.from_("documents").remove([stored_name])
@@ -384,19 +396,12 @@ def upload_document():
                 print("SUPABASE CLEANUP ERROR:", str(storage_error))
 
         return jsonify({
-            "error": f"Document processing failed: {str(error)}"
+            "error": "Document processing failed. Please try again."
         }), 500
 
     finally:
 
-        # Remove temporary local copy
         file_path.unlink(missing_ok=True)
-
-        if connection is not None:
-            try:
-                connection.close()
-            except Exception:
-                pass
 
 
 # ---------------------------------
@@ -406,20 +411,23 @@ def upload_document():
 @app.route("/api/documents", methods=["GET"])
 def get_documents():
 
-    connection = get_connection()
-
     try:
 
-        documents = connection.execute("""
-            SELECT id, filename, file_type, category, uploaded_at
-            FROM documents
-            ORDER BY uploaded_at DESC
-        """).fetchall()
+        documents = documents_collection.find().sort(
+            "uploaded_at",
+            -1
+        )
 
-        return jsonify([dict(document) for document in documents])
+        return jsonify([
+            format_document(document)
+            for document in documents
+        ])
 
-    finally:
-        connection.close()
+    except Exception as error:
+
+        print("GET DOCUMENTS ERROR:", str(error))
+
+        return jsonify({"error": "Unable to retrieve documents"}), 500
 
 
 # ---------------------------------
@@ -429,21 +437,22 @@ def get_documents():
 @app.route("/api/documents/<int:document_id>", methods=["GET"])
 def get_document(document_id):
 
-    connection = get_connection()
-
     try:
 
-        document = connection.execute("""
-            SELECT * FROM documents WHERE id = ?
-        """, (document_id,)).fetchone()
+        document = documents_collection.find_one({
+            "id": document_id
+        })
 
-    finally:
-        connection.close()
+        if document is None:
+            return jsonify({"error": "Document not found"}), 404
 
-    if document is None:
-        return jsonify({"error": "Document not found"}), 404
+        return jsonify(format_document(document))
 
-    return jsonify(dict(document))
+    except Exception as error:
+
+        print("GET DOCUMENT ERROR:", str(error))
+
+        return jsonify({"error": "Unable to retrieve document"}), 500
 
 
 # ---------------------------------
@@ -453,36 +462,29 @@ def get_document(document_id):
 @app.route("/api/documents/<int:document_id>/view", methods=["GET"])
 def view_document(document_id):
 
-    connection = get_connection()
-
     try:
 
-        document = connection.execute("""
-            SELECT filename, stored_name, file_type
-            FROM documents
-            WHERE id = ?
-        """, (document_id,)).fetchone()
+        document = documents_collection.find_one({
+            "id": document_id
+        })
 
-    finally:
-        connection.close()
+        if document is None:
+            return jsonify({"error": "Document not found"}), 404
 
-    if document is None:
-        return jsonify({"error": "Document not found"}), 404
+        stored_name = document["stored_name"]
+        filename = document["filename"]
+        extension = document["file_type"].lower()
 
-    stored_name = document["stored_name"]
-    filename = document["filename"]
-    extension = document["file_type"].lower()
-
-    try:
-
-        # First try to retrieve the file from Supabase
         file_data = supabase.storage.from_("documents").download(
             stored_name
         )
 
         return send_file(
             BytesIO(file_data),
-            mimetype=CONTENT_TYPES.get(extension, "application/octet-stream"),
+            mimetype=CONTENT_TYPES.get(
+                extension,
+                "application/octet-stream"
+            ),
             download_name=filename,
             as_attachment=False
         )
@@ -490,18 +492,6 @@ def view_document(document_id):
     except Exception as error:
 
         print("SUPABASE VIEW ERROR:", str(error))
-
-        # Fallback for older files still present locally
-        local_file = UPLOAD_FOLDER / stored_name
-
-        if local_file.exists():
-
-            return send_file(
-                local_file,
-                mimetype=CONTENT_TYPES.get(extension, "application/octet-stream"),
-                download_name=filename,
-                as_attachment=False
-            )
 
         return jsonify({
             "error": "Unable to retrieve document from storage"
@@ -515,21 +505,17 @@ def view_document(document_id):
 @app.route("/api/documents/<int:document_id>", methods=["DELETE"])
 def delete_document(document_id):
 
-    connection = get_connection()
-
     try:
 
-        document = connection.execute("""
-            SELECT stored_name FROM documents WHERE id = ?
-        """, (document_id,)).fetchone()
+        document = documents_collection.find_one({
+            "id": document_id
+        })
 
         if document is None:
             return jsonify({"error": "Document not found"}), 404
 
         stored_name = document["stored_name"]
-        local_file = UPLOAD_FOLDER / stored_name
 
-        # Remove file from Supabase Storage
         try:
 
             supabase.storage.from_("documents").remove([stored_name])
@@ -538,29 +524,26 @@ def delete_document(document_id):
 
             print("SUPABASE DELETE ERROR:", str(storage_error))
 
-            # Allow deletion of older local-only files
-            if not local_file.exists():
+            return jsonify({
+                "error": "Could not delete document from storage"
+            }), 500
 
-                return jsonify({
-                    "error": "Could not delete document from storage"
-                }), 500
+        documents_collection.delete_one({
+            "id": document_id
+        })
 
-        # Delete metadata from database
-        connection.execute("""
-            DELETE FROM documents WHERE id = ?
-        """, (document_id,))
-
-        connection.commit()
-
-        # Delete any remaining local copy
+        local_file = UPLOAD_FOLDER / stored_name
         local_file.unlink(missing_ok=True)
 
         return jsonify({
             "message": "Document deleted successfully"
         })
 
-    finally:
-        connection.close()
+    except Exception as error:
+
+        print("DELETE DOCUMENT ERROR:", str(error))
+
+        return jsonify({"error": "Unable to delete document"}), 500
 
 
 # ---------------------------------
@@ -575,21 +558,28 @@ def search_documents():
     if not query:
         return jsonify({"error": "Enter a search term"}), 400
 
-    connection = get_connection()
-
     try:
 
-        documents = connection.execute("""
-            SELECT id, filename, file_type, category, uploaded_at
-            FROM documents
-            WHERE filename LIKE ? OR extracted_text LIKE ?
-            ORDER BY uploaded_at DESC
-        """, (f"%{query}%", f"%{query}%")).fetchall()
+        search_pattern = re.escape(query)
 
-        return jsonify([dict(document) for document in documents])
+        documents = documents_collection.find({
+            "$or": [
+                {"filename": {"$regex": search_pattern, "$options": "i"}},
+                {"extracted_text": {"$regex": search_pattern, "$options": "i"}},
+                {"category": {"$regex": search_pattern, "$options": "i"}}
+            ]
+        }).sort("uploaded_at", -1)
 
-    finally:
-        connection.close()
+        return jsonify([
+            format_document(document)
+            for document in documents
+        ])
+
+    except Exception as error:
+
+        print("SEARCH ERROR:", str(error))
+
+        return jsonify({"error": "Search failed"}), 500
 
 
 # ---------------------------------
@@ -619,32 +609,32 @@ def summarize_document(document_id):
             "error": "Choose short, medium or detailed summary"
         }), 400
 
-    connection = get_connection()
-
     try:
 
-        document = connection.execute("""
-            SELECT filename, extracted_text
-            FROM documents
-            WHERE id = ?
-        """, (document_id,)).fetchone()
+        document = documents_collection.find_one(
+            {"id": document_id},
+            {"filename": 1, "extracted_text": 1, "_id": 0}
+        )
 
-    finally:
-        connection.close()
+        if document is None:
+            return jsonify({"error": "Document not found"}), 404
 
-    if document is None:
-        return jsonify({"error": "Document not found"}), 404
+        summary = generate_summary(
+            document.get("extracted_text", ""),
+            length
+        )
 
-    summary = generate_summary(
-        document["extracted_text"],
-        length
-    )
+        return jsonify({
+            "filename": document["filename"],
+            "summary_type": length,
+            "summary": summary
+        })
 
-    return jsonify({
-        "filename": document["filename"],
-        "summary_type": length,
-        "summary": summary
-    })
+    except Exception as error:
+
+        print("SUMMARY ERROR:", str(error))
+
+        return jsonify({"error": "Unable to summarize document"}), 500
 
 
 # ---------------------------------
@@ -657,30 +647,32 @@ def summarize_document(document_id):
 )
 def extract_document_information(document_id):
 
-    connection = get_connection()
-
     try:
 
-        document = connection.execute("""
-            SELECT filename, extracted_text
-            FROM documents
-            WHERE id = ?
-        """, (document_id,)).fetchone()
+        document = documents_collection.find_one(
+            {"id": document_id},
+            {"filename": 1, "extracted_text": 1, "_id": 0}
+        )
 
-    finally:
-        connection.close()
+        if document is None:
+            return jsonify({"error": "Document not found"}), 404
 
-    if document is None:
-        return jsonify({"error": "Document not found"}), 404
+        information = extract_key_information(
+            document.get("extracted_text", "")
+        )
 
-    information = extract_key_information(
-        document["extracted_text"]
-    )
+        return jsonify({
+            "filename": document["filename"],
+            "information": information
+        })
 
-    return jsonify({
-        "filename": document["filename"],
-        "information": information
-    })
+    except Exception as error:
+
+        print("EXTRACTION ERROR:", str(error))
+
+        return jsonify({
+            "error": "Unable to extract document information"
+        }), 500
 
 
 # ---------------------------------
@@ -696,7 +688,7 @@ def file_too_large(error):
 
 
 # ---------------------------------
-# CREATE DATABASE TABLES
+# CONNECT TO MONGODB
 # ---------------------------------
 
 create_tables()
@@ -710,4 +702,8 @@ if __name__ == "__main__":
 
     print("Document Management System backend started!")
 
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=False
+    )

@@ -6,3 +6,4 @@ gunicorn
 psycopg[binary]
 supabase
 python-dotenv
+pymongo[srv]
